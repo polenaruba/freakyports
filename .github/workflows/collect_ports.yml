@@ -1,0 +1,366 @@
+name: Release Ports
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force update all ports'
+        required: true
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+  push:
+    paths:
+      - 'ports/released/**'
+
+concurrency:
+  group: release-ports
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y zip jq gh
+
+      - name: Prepare environment
+        run: |
+          mkdir -p temp_ports
+          [ -f docs/ports.json ] || echo "[]" > docs/ports.json
+
+      # ---------------------- DETERMINE PORTS ----------------------
+      - name: Determine ports to process
+        id: ports
+        run: |
+          set -euo pipefail
+
+          FORCE="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force || 'false' }}"
+          PORT_DIRS=()
+
+          # Resolve the diff base. We need to find every port changed since
+          # this workflow last ran so we don't miss updates when multiple
+          # commits land between runs.
+          #
+          # Strategy: diff HEAD against the commit that last modified
+          # docs/ports.json — that file is this workflow's output, so the
+          # commit that last touched it marks the previous successful run.
+          # For push events we can also trust github.event.before as a
+          # narrower and more accurate range.
+          resolve_base() {
+            case "${{ github.event_name }}" in
+              push)
+                local before="${{ github.event.before || '' }}"
+                # A fresh branch push has before=0000...; fall through.
+                if [[ -n "$before" && "$before" != "0000000000000000000000000000000000000000" ]]; then
+                  echo "$before"
+                  return
+                fi
+                ;;
+            esac
+            # Fall back to the last commit that touched docs/ports.json.
+            # If the file has never been committed, fall back to HEAD~1.
+            local last
+            last=$(git log -1 --format=%H -- docs/ports.json 2>/dev/null || true)
+            if [[ -n "$last" ]]; then
+              # We want the commit BEFORE that one so the diff includes the
+              # ports.json update itself (which matters for edge cases where
+              # a port dir was deleted alongside a ports.json update).
+              echo "${last}^"
+            else
+              echo "HEAD~1"
+            fi
+          }
+
+          if [ "$FORCE" = "true" ]; then
+            mapfile -t PORT_DIRS < <(
+              find ports/released -name port.json -type f -print0 |
+              xargs -0 -n1 dirname | sort -u
+            )
+          else
+            BASE=$(resolve_base)
+            echo "Diff base: $BASE  HEAD: $(git rev-parse HEAD)"
+            {
+              git diff --name-only "$BASE" HEAD 2>/dev/null ||
+              git diff --name-only HEAD~1 HEAD ||
+              true
+            } | while read -r file; do
+              [[ "$file" == ports/released/* ]] || continue
+              # First: the file is somewhere inside the port_dir. Walk up
+              # until we hit a dir containing port.json.
+              dir="$(dirname "$file")"
+              found=""
+              while [[ "$dir" != "." && "$dir" != "/" ]]; do
+                if [[ -f "$dir/port.json" ]]; then
+                  found="$dir"; break
+                fi
+                dir="$(dirname "$dir")"
+              done
+              if [[ -n "$found" ]]; then
+                echo "$found"
+                continue
+              fi
+              # Second: the file is a launcher (.sh) sitting in the staging
+              # dir as a sibling of the port_dir. Check immediate children
+              # of the file's parent for port.json. Category-level dirs
+              # (which contain staging dirs, not port_dirs) won't match.
+              parent="$(dirname "$file")"
+              for child in "$parent"/*/; do
+                if [[ -f "${child}port.json" ]]; then
+                  echo "${child%/}"
+                  break
+                fi
+              done
+            done | sort -u > /tmp/ports.txt
+
+            mapfile -t PORT_DIRS < /tmp/ports.txt
+          fi
+
+          [[ "${#PORT_DIRS[@]}" -gt 0 ]] || exit 0
+
+          {
+            echo "ports<<EOF"
+            printf '%s\n' "${PORT_DIRS[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---------------------- PROCESS PORTS ----------------------
+      - name: Process ports
+        if: steps.ports.outputs.ports != ''
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${{ steps.ports.outputs.ports }}" ]]; then
+            echo "No ports to process; skipping."
+            exit 0
+          fi
+          mapfile -t PORT_DIRS <<< "${{ steps.ports.outputs.ports }}"
+          PORTS_JSON="docs/ports.json"
+
+          for PORT_DIR in "${PORT_DIRS[@]}"; do
+            PORT_JSON="$PORT_DIR/port.json"
+            STAGING_DIR="$(dirname "$PORT_DIR")"
+
+            CANONICAL_NAME=$(jq -r '.name' "$PORT_JSON")
+            [[ -n "$CANONICAL_NAME" ]] || continue
+
+            # Fail loudly on bad asset names
+            if [[ ! "$CANONICAL_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::Port '$PORT_DIR' has name '$CANONICAL_NAME' with characters GitHub strips from asset names. Rename \"name\" in port.json to a clean slug matching [A-Za-z0-9._-]."
+              exit 1
+            fi
+
+            SCREENSHOT=$(find "$PORT_DIR" -maxdepth 1 -iname 'screenshot*.png' -o -iname 'screenshot*.jpg' -o -iname 'screenshot*.jpeg' | head -n1)
+            [[ -n "$SCREENSHOT" ]] || continue
+
+            README=$(find "$PORT_DIR" -maxdepth 1 \( -iname "README.md" -o -iname "readme.md" \) | head -n1 || echo "")
+            ZIP_PATH="temp_ports/$CANONICAL_NAME"
+            (cd "$STAGING_DIR" && zip -qr "$GITHUB_WORKSPACE/$ZIP_PATH" .)
+
+            SIZE=$(stat -c %s "$ZIP_PATH")
+            MD5=$(md5sum "$ZIP_PATH" | awk '{print $1}')
+            DATE_UPDATED=$(date -u +"%Y-%m-%dT%H:%M")
+
+            # URLs
+            SCREENSHOT_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/${SCREENSHOT#"$GITHUB_WORKSPACE/"}"
+            README_URL=""
+            [[ -n "$README" ]] && README_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/${README#"$GITHUB_WORKSPACE/"}"
+            DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/ports-latest/${CANONICAL_NAME}"
+
+            # Last commit message — use STAGING_DIR so launcher (.sh) changes
+            # that live as siblings of the port_dir are also picked up.
+            COMMIT_MSG=$(git log -1 --format=%s -- "$STAGING_DIR")
+
+            # Check if entry already exists (match by canonical name)
+            EXISTING=$(jq -c --arg name "$CANONICAL_NAME" '.[] | select(.name == $name)' "$PORTS_JSON" 2>/dev/null || echo "")
+
+            if [[ -n "$EXISTING" ]]; then
+              OLD_MD5=$(echo "$EXISTING" | jq -r '.source.md5 // empty')
+              OLD_SIZE=$(echo "$EXISTING" | jq -r '.source.size // empty')
+              if [[ "$MD5" == "$OLD_MD5" && "$SIZE" == "$OLD_SIZE" ]]; then
+                DATE_UPDATED=$(echo "$EXISTING" | jq -r '.source.date_updated')
+                # Zip matches what's already on the release; drop it so the
+                # upload step doesn't re-clobber an identical asset.
+                echo "[$CANONICAL_NAME] md5 unchanged — skipping upload"
+                rm -f "$ZIP_PATH"
+              fi
+            fi
+
+            # first_seen is set ONCE per port and preserved across runs. New
+            # ports get today's date. Pharos uses this to sort by newest and
+            # to differentiate brand-new releases from routine updates.
+            FIRST_SEEN=""
+            if [[ -n "$EXISTING" ]]; then
+              FIRST_SEEN=$(echo "$EXISTING" | jq -r '.source.first_seen // empty')
+            fi
+            if [[ -z "$FIRST_SEEN" ]]; then
+              FIRST_SEEN=$(date -u +"%Y-%m-%d")
+            fi
+
+            MERGED=$(jq -n \
+              --argjson o "$(cat "$PORT_JSON")" \
+              --arg d "$DATE_UPDATED" \
+              --arg download_url "$DOWNLOAD_URL" \
+              --arg readme_url "$README_URL" \
+              --arg screenshot_url "$SCREENSHOT_URL" \
+              --arg m "$MD5" \
+              --arg s "$SIZE" \
+              --arg c "$COMMIT_MSG" \
+              --arg fs "$FIRST_SEEN" \
+              '$o + {source:{
+                screenshot_url:$screenshot_url,
+                readme_url:$readme_url,
+                download_url:$download_url,
+                date_updated:$d,
+                first_seen:$fs,
+                md5:$m,
+                size:($s|tonumber),
+                last_commit:$c
+              }}')
+
+            jq --arg n "$CANONICAL_NAME" --argjson p "$MERGED" \
+              'map(select(.name!=$n)) + [$p] | sort_by(.attr.title // "Untitled")' \
+              "$PORTS_JSON" > "$PORTS_JSON.tmp"
+
+            mv "$PORTS_JSON.tmp" "$PORTS_JSON"
+          done
+
+      # ---------------------- SYNC DISK, JSON, AND RELEASE ----------------------
+      - name: Purge deleted or invalid ports
+        run: |
+          set -euo pipefail
+          PORTS_JSON="$GITHUB_WORKSPACE/docs/ports.json"
+
+          echo "Validating ports on disk..."
+
+          # Collect canonical names from disk
+          VALID_NAMES=()
+          while IFS= read -r json_file; do
+            dir="$(dirname "$json_file")"
+
+            SCREENSHOT=$(find "$dir" -maxdepth 1 \
+              \( -iname "screenshot*.png" -o -iname "screenshot*.jpg" -o -iname "screenshot*.jpeg" \) \
+              | head -n1)
+
+            [[ -n "$SCREENSHOT" ]] || {
+              echo "Skipping invalid port (no screenshot): $dir"
+              continue
+            }
+
+            NAME=$(jq -r '.name // empty' "$json_file")
+            [[ -n "$NAME" ]] && VALID_NAMES+=("$NAME")
+          done < <(find ports/released -type f -name 'port.json')
+
+          # Nothing valid on disk → hard stop
+          [[ "${#VALID_NAMES[@]}" -gt 0 ]] || {
+            echo "No valid ports found on disk; refusing to purge"
+            exit 0
+          }
+
+          # Prune ports.json (keep only disk-backed ports)
+          VALID_NAMES_JSON=$(printf '%s\n' "${VALID_NAMES[@]}" | jq -R . | jq -s .)
+
+          TMP=$(mktemp)
+          jq --argjson valid "$VALID_NAMES_JSON" \
+            'map(select(.name as $n | $valid | index($n)))' \
+            "$PORTS_JSON" > "$TMP" && mv "$TMP" "$PORTS_JSON"
+
+          echo "ports.json synced (Valid ports: ${#VALID_NAMES[@]})"
+
+          # Prune release assets (mirror ports.json logic).
+          # The release might not exist on the very first workflow run —
+          # don't fail in that case, just skip asset pruning.
+          RELEASE_ID=$(gh api repos/${GITHUB_REPOSITORY}/releases/tags/ports-latest --jq '.id' 2>/dev/null || true)
+          if [[ -z "$RELEASE_ID" || "$RELEASE_ID" == "null" ]]; then
+            echo "No ports-latest release yet; skipping asset pruning."
+            exit 0
+          fi
+
+          mapfile -t ASSETS < <(
+            gh api --paginate repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID/assets \
+              --jq '.[] | "\(.name):\(.id)"'
+          )
+
+          for asset in "${ASSETS[@]}"; do
+            ASSET_NAME="${asset%%:*}"
+            ASSET_ID="${asset#*:}"
+
+            [[ "$ASSET_NAME" == *.zip ]] || continue
+
+            # images.zip is not a port
+            [[ "$ASSET_NAME" == "images.zip" ]] && continue
+
+            if ! printf '%s\n' "${VALID_NAMES[@]}" | grep -iqx "$ASSET_NAME"; then
+              echo "Deleting orphaned asset: $ASSET_NAME"
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/$ASSET_ID" || echo "Failed to delete $ASSET_NAME"
+            fi
+          done
+
+      # ---------------------- RELEASE ----------------------
+      - name: Ensure release exists
+        run: |
+          gh release view ports-latest >/dev/null 2>&1 || \
+          gh release create ports-latest --title "Ports" --notes "Automated release"
+
+      - name: Upload assets
+        if: steps.ports.outputs.ports != ''
+        run: |
+          shopt -s nullglob
+          zips=(temp_ports/*.zip)
+          if (( ${#zips[@]} == 0 )); then
+            echo "No changed zips to upload."
+            exit 0
+          fi
+          for f in "${zips[@]}"; do
+            gh release upload ports-latest "$f" --clobber
+          done
+
+      # ---------------------- PORTMASTER CATALOG ----------------------
+      # Publishes a PortMasterV3 catalog (ports.json + images.zip + a
+      # *.source.json) to the ports-latest release so stock PortMaster can
+      # browse this repo as a third-party source. Pharos also prefers this
+      # images.zip over the screenshots-latest one.
+      - name: Publish PortMaster catalog
+        run: bash buildtools/publish_pm_catalog.sh
+
+      - name: Commit ports.json
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add docs/ports.json
+          if git diff --cached --quiet; then
+            echo "No ports.json changes to commit"
+            exit 0
+          fi
+          git commit -m "Update ports.json"
+
+          # Retry fetch+rebase+push to absorb concurrent pushes from other
+          # workflows hitting the same branch.
+          for attempt in 1 2 3 4 5; do
+            git fetch origin "$GITHUB_REF_NAME"
+            if ! git rebase "origin/$GITHUB_REF_NAME"; then
+              echo "::error::rebase failed on attempt $attempt"
+              git rebase --abort || true
+              exit 1
+            fi
+            if git push origin "HEAD:$GITHUB_REF_NAME"; then
+              echo "Pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "Push rejected on attempt $attempt; retrying..."
+            sleep $((attempt * 3))
+          done
+          echo "::error::Push failed after 5 attempts"
+          exit 1
